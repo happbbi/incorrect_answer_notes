@@ -1,9 +1,6 @@
 streamlit
 pymupdf
-reportlab
 pillow
-opencv-python
-numpy
-pytesseract
+reportlab
 sqlalchemy
-psycopg2-binary
+psycopg[binary]
