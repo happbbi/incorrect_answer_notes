@@ -1,97 +1,115 @@
+import hmac
+import io
+import os
+import re
+
+import fitz  # PyMuPDF
+import streamlit as st
+from PIL import Image
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
+from sqlalchemy import (Column, Integer, LargeBinary, MetaData, String, Table,
+                        create_engine, delete, func, insert, select, update)
+
 # ---------------------------------------------------------------------------
-# 데이터베이스 연동 조작 함수 (추가/수정/삭제/체크)
+# 데이터베이스
+#  - secrets 에 [db] url 이 있으면 그 외부 Postgres DB 사용 (서버가 재시작/슬립해도 유지)
+#  - 없으면 로컬 파일(study_notes.db, SQLite) 사용 (내 컴퓨터 테스트용)
 # ---------------------------------------------------------------------------
-def add_problems_to_db(subject, items):
-    """items: [(file_name, data, file_group, label), ...] 를 한 번에 저장"""
-    if not items:
+metadata = MetaData()
+subjects_t = Table("subjects", metadata, Column("name", String, primary_key=True))
+problems_t = Table(
+    "problems", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("subject", String),
+    Column("file_name", String),
+    Column("file_group", String),
+    Column("label", String),
+    Column("data", LargeBinary),
+    Column("checked", Integer, default=0),
+    sqlite_autoincrement=True,
+)
+
+
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    url = None
+    try:
+        url = st.secrets["db"]["url"]
+    except Exception:
+        pass
+    if url:
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        engine = create_engine(url, pool_pre_ping=True, pool_recycle=300)
+    else:
+        engine = create_engine("sqlite:///study_notes.db",
+                               connect_args={"check_same_thread": False})
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        if conn.execute(select(func.count()).select_from(subjects_t)).scalar() == 0:
+            conn.execute(insert(subjects_t), [{"name": n} for n in ["수학", "영어", "국어"]])
+    return engine
+
+
+def load_meta():
+    """과목/문항 목록만 불러옴 (이미지 본문은 필요할 때 get_image 로 따로 가져옴)"""
+    with get_engine().connect() as conn:
+        subjects = [r[0] for r in conn.execute(
+            select(subjects_t.c.name).order_by(subjects_t.c.name))]
+        rows = conn.execute(
+            select(problems_t.c.id, problems_t.c.subject, problems_t.c.file_name,
+                   problems_t.c.file_group, problems_t.c.label, problems_t.c.checked)
+            .order_by(problems_t.c.id)
+        ).all()
+    probs = {}
+    for pid, subj, fname, fgroup, label, checked in rows:
+        probs.setdefault(subj, []).append({
+            "id": pid,
+            "file_name": fname,
+            "file": fgroup or "파일",
+            "label": label or fname,
+            "type": "image",
+            "checked": bool(checked),
+        })
+    return subjects, probs
+
+
+def refresh_session():
+    subjects, probs = load_meta()
+    st.session_state["subjects_list"] = subjects
+    st.session_state["uploaded_problems"] = probs
+
+
+@st.cache_data(max_entries=300, show_spinner=False)
+def get_image(pid):
+    with get_engine().connect() as conn:
+        row = conn.execute(select(problems_t.c.data).where(problems_t.c.id == pid)).first()
+    return bytes(row[0]) if row and row[0] is not None else b""
+
+
+def require_password():
+    """secrets 에 app_password 를 넣으면 비밀번호를 입력해야 앱을 쓸 수 있음 (선택)"""
+    try:
+        correct = st.secrets["app_password"]
+    except Exception:
         return
-    rows = [
-        {"subject": subject, "file_name": n, "file_group": g,
-         "label": lb, "data": d, "checked": 0}
-        for n, d, g, lb in items
-    ]
-    with get_engine().begin() as conn:
-        conn.execute(insert(problems_t), rows)
+    if st.session_state.get("authed"):
+        return
+    pw = st.text_input("비밀번호", type="password")
+    if pw:
+        if hmac.compare_digest(pw.encode(), str(correct).encode()):
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸습니다.")
+    st.stop()
+
+
+if "subjects_list" not in st.session_state or "uploaded_problems" not in st.session_state:
     refresh_session()
-
-
-def delete_problem_from_db(subject, pid):
-    with get_engine().begin() as conn:
-        conn.execute(delete(problems_t).where(problems_t.c.id == pid))
-    refresh_session()
-
-
-def update_problem_check_in_db(pid, checked_val):
-    with get_engine().begin() as conn:
-        conn.execute(update(problems_t).where(problems_t.c.id == pid)
-                     .values(checked=1 if checked_val else 0))
-
-
-def add_subject_to_db(new_subj):
-    with get_engine().begin() as conn:
-        exists = conn.execute(
-            select(subjects_t.c.name).where(subjects_t.c.name == new_subj)).first()
-        if not exists:
-            conn.execute(insert(subjects_t).values(name=new_subj))
-    refresh_session()
-
-
-def rename_subject_in_db(old_subj, new_subj):
-    with get_engine().begin() as conn:
-        conn.execute(update(subjects_t).where(subjects_t.c.name == old_subj)
-                     .values(name=new_subj))
-        conn.execute(update(problems_t).where(problems_t.c.subject == old_subj)
-                     .values(subject=new_subj))
-    refresh_session()
-
-
-def delete_subject_from_db(target_subj):
-    with get_engine().begin() as conn:
-        conn.execute(delete(problems_t).where(problems_t.c.subject == target_subj))
-        conn.execute(delete(subjects_t).where(subjects_t.c.name == target_subj))
-    refresh_session()
-
-
-def build_pdf(problems):
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    pw, ph = A4
-    m = 40
-    box_w, box_h = pw - 2 * m, ph - 2 * m
-    for p in problems:
-        img = Image.open(io.BytesIO(get_image(p["id"]))).convert("RGB")
-        iw, ih = img.size
-        scale = min(box_w / iw, box_h / ih)
-        w, h = iw * scale, ih * scale
-        c.drawImage(ImageReader(img), m + (box_w - w) / 2, ph - m - h, width=w, height=h)
-        c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-def on_check(pid, key):
-    val = st.session_state[key]
-    update_problem_check_in_db(pid, val)
-    for subj in st.session_state["uploaded_problems"]:
-        for p in st.session_state["uploaded_problems"][subj]:
-            if p["id"] == pid:
-                p["checked"] = val
-
-
-def set_all(subject, file_group, value):
-    with get_engine().begin() as conn:
-        conn.execute(
-            update(problems_t)
-            .where(problems_t.c.subject == subject, problems_t.c.file_group == file_group)
-            .values(checked=1 if value else 0)
-        )
-    refresh_session()
-    # 이미 화면에 떠 있는 체크박스 상태도 같이 바꿔 줘야 '전체 체크/해제'가 화면에 반영됨
-    for p in st.session_state["uploaded_problems"].get(subject, []):
-        if p["file"] == file_group:
-            st.session_state[f"tab4_chk_{subject}_{p['id']}"] = value
-
-
+    
 # ---------------------------------------------------------------------------
 # 데이터베이스 연동 조작 함수 (추가/수정/삭제/체크)
 # ---------------------------------------------------------------------------
