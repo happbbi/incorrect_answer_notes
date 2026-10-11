@@ -5,3 +5,5 @@ pillow
 opencv-python
 numpy
 pytesseract
+sqlalchemy
+psycopg2-binary
